@@ -1,0 +1,42 @@
+rs03_torque_closed_loop:
+  ros__parameters:
+    transport: serial
+    serial_device: /dev/ttyUSB0
+    serial_baud: 921600
+    serial_debug: false
+    can_interface: can0
+    motor_id: 12
+    master_id: 255
+
+    control_mode: velocity_pi       # velocity_pi | position_pid | mit_impedance
+    auto_enable: false              # first valid command performs the actual enable
+    command_timeout_s: 0.30
+    receive_timeout_ms: 20
+    feedback_miss_limit: 10
+
+    max_torque_nm: 0.50
+    torque_slew_rate_nm_s: 2.0
+    max_velocity_rad_s: 0.80
+    velocity_trip_samples: 5
+    max_temperature_c: 60.0
+
+    max_velocity_command_rad_s: 0.30
+    velocity_kp: 0.40
+    velocity_ki: 0.30
+    velocity_integral_limit_nm: 0.20
+    velocity_feedforward_nm: 0.0
+
+    position_max_offset_rad: 0.15
+    position_tracking_error_rad: 0.25
+    position_kp: 2.0
+    position_ki: 0.0
+    position_kd: 0.20
+    position_integral_limit_nm: 0.10
+    position_feedforward_nm: 0.0
+
+    mit_kp: 2.0
+    mit_kd: 0.20
+    mit_feedforward_torque_nm: 0.0
+    mit_position_slew_rate_rad_s: 0.05
+
+    velocity_filter_alpha: 0.20
