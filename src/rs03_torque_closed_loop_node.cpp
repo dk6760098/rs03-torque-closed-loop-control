@@ -460,6 +460,7 @@ class Rs03TorqueClosedLoopNode final : public rclcpp::Node {
     const auto serial_debug = declare_parameter("serial_debug", false);
     const auto motor_id = declare_parameter("motor_id", 1);
     const auto master_id = declare_parameter("master_id", 255);
+    const auto mit_host_id = declare_parameter("mit_host_id", 0);
     motor_protocol_ = declare_parameter("motor_protocol", "private");
     protocol_switch_target_ =
         declare_parameter("protocol_switch_target", "none");
@@ -499,8 +500,10 @@ class Rs03TorqueClosedLoopNode final : public rclcpp::Node {
     max_temperature_c_ = declare_parameter("max_temperature_c", 60.0);
     feedback_miss_limit_ = declare_parameter("feedback_miss_limit", 10);
     const auto receive_timeout = declare_parameter("receive_timeout_ms", 20);
-    if (motor_id < 0 || motor_id > 255 || master_id < 0 || master_id > 255)
-      throw std::invalid_argument("motor_id and master_id must be in [0, 255]");
+    if (motor_id < 0 || motor_id > 255 || master_id < 0 || master_id > 255 ||
+        mit_host_id < 0 || mit_host_id > 255)
+      throw std::invalid_argument(
+          "motor_id, master_id, and mit_host_id must be in [0, 255]");
     if (timeout_s_ <= 0.0 || receive_timeout < 0)
       throw std::invalid_argument("timeouts must be positive");
     if (max_torque_nm_ <= 0.0 || torque_slew_rate_ <= 0.0 ||
@@ -544,7 +547,8 @@ class Rs03TorqueClosedLoopNode final : public rclcpp::Node {
           "protocol switching requires auto_enable=false");
     can_ = std::make_unique<Rs03Can>(
         transport, iface, serial_device, serial_baud, serial_debug,
-        static_cast<uint8_t>(master_id), static_cast<uint8_t>(motor_id),
+        static_cast<uint8_t>(motor_protocol_ == "mit" ? mit_host_id : master_id),
+        static_cast<uint8_t>(motor_id),
         receive_timeout, motor_protocol_);
 
     const std::string command_topic = mode_ == "velocity_pi"

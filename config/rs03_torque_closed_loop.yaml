@@ -7,6 +7,7 @@ rs03_torque_closed_loop:
     can_interface: can0
     motor_id: 12
     master_id: 255
+    mit_host_id: 0                 # MIT standard-frame feedback CAN ID
     motor_protocol: private         # private | mit (must match motor flash setting)
     protocol_switch_target: none    # none | private | mit; switching needs power cycle
 
