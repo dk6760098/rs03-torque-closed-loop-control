@@ -460,7 +460,7 @@ class Rs03TorqueClosedLoopNode final : public rclcpp::Node {
     const auto serial_debug = declare_parameter("serial_debug", false);
     const auto motor_id = declare_parameter("motor_id", 1);
     const auto master_id = declare_parameter("master_id", 255);
-    const auto mit_host_id = declare_parameter("mit_host_id", 0);
+    const auto mit_host_id = declare_parameter("mit_host_id", 0xfd);
     motor_protocol_ = declare_parameter("motor_protocol", "private");
     protocol_switch_target_ =
         declare_parameter("protocol_switch_target", "none");
@@ -595,7 +595,21 @@ class Rs03TorqueClosedLoopNode final : public rclcpp::Node {
 
     can_->stop();
     Rs03Can::Feedback probe{};
-    const bool motor_online = can_->receive_feedback(probe);
+    bool motor_online = can_->receive_feedback(probe);
+    if (!motor_online && motor_protocol_ == "mit") {
+      // The RS03 MIT disable frame does not produce status feedback.  Probe
+      // with a zero-gain, zero-feedforward command, then immediately disable.
+      // With Kp=Kd=tau_ff=0 this command cannot request holding or motion
+      // torque, regardless of the encoded position and velocity fields.
+      RCLCPP_INFO(get_logger(),
+                  "MIT stop frame returned no feedback; running zero-output "
+                  "feedback probe");
+      can_->set_mit(0.0F, 0.0F, 0.0F, 0.0F, 0.0F);
+      can_->enable();
+      can_->set_mit(0.0F, 0.0F, 0.0F, 0.0F, 0.0F);
+      motor_online = can_->receive_feedback(probe);
+      can_->stop();
+    }
     if (motor_online) {
       startup_position_rad_ = probe.position_rad;
       last_position_feedback_rad_ = probe.position_rad;
@@ -609,7 +623,7 @@ class Rs03TorqueClosedLoopNode final : public rclcpp::Node {
                   probe.temperature_c);
     }
     else
-      RCLCPP_WARN(get_logger(), "no RS03 feedback after safe stop probe");
+      RCLCPP_WARN(get_logger(), "no RS03 feedback after safe zero-output probe");
 
     if (protocol_switch_target_ != "none") {
       if (protocol_switch_target_ == motor_protocol_) {

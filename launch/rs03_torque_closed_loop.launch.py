@@ -28,7 +28,7 @@ def generate_launch_description():
                               choices=["private", "mit"]),
         DeclareLaunchArgument("protocol_switch_target", default_value="none",
                               choices=["none", "private", "mit"]),
-        DeclareLaunchArgument("mit_host_id", default_value="0"),
+        DeclareLaunchArgument("mit_host_id", default_value="253"),
         DeclareLaunchArgument("command_timeout_s", default_value="0.30"),
         DeclareLaunchArgument("max_torque_nm", default_value="0.50"),
         DeclareLaunchArgument("torque_slew_rate_nm_s", default_value="2.0"),
