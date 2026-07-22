@@ -29,6 +29,8 @@ def generate_launch_description():
         DeclareLaunchArgument("protocol_switch_target", default_value="none",
                               choices=["none", "private", "mit"]),
         DeclareLaunchArgument("mit_host_id", default_value="253"),
+        DeclareLaunchArgument("mit_scan_ids", default_value="false",
+                              choices=["true", "false"]),
         DeclareLaunchArgument("command_timeout_s", default_value="0.30"),
         DeclareLaunchArgument("max_torque_nm", default_value="0.50"),
         DeclareLaunchArgument("torque_slew_rate_nm_s", default_value="2.0"),
@@ -61,6 +63,8 @@ def generate_launch_description():
         "motor_protocol": LaunchConfiguration("motor_protocol"),
         "protocol_switch_target": LaunchConfiguration("protocol_switch_target"),
         "mit_host_id": int_param("mit_host_id"),
+        "mit_scan_ids": ParameterValue(
+            LaunchConfiguration("mit_scan_ids"), value_type=bool),
         "command_timeout_s": float_param("command_timeout_s"),
         "max_torque_nm": float_param("max_torque_nm"),
         "torque_slew_rate_nm_s": float_param("torque_slew_rate_nm_s"),

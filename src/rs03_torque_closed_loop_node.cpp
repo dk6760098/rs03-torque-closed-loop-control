@@ -274,6 +274,30 @@ class Rs03Can {
     send_standard(motor_id_, data);
   }
 
+  bool scan_mit_motor_ids(uint16_t &probed_id, uint16_t &response_can_id,
+                          uint8_t &reported_motor_id) {
+    if (!mit_protocol_)
+      throw std::logic_error("MIT ID scan requested in private protocol");
+    std::array<uint8_t, 8> stop_data{};
+    stop_data.fill(0xff);
+    stop_data[7] = 0xfd;
+    for (uint16_t candidate = 0; candidate <= 0xff; ++candidate) {
+      send_standard(candidate, stop_data);
+      const auto deadline = std::chrono::steady_clock::now() +
+                            std::chrono::milliseconds(receive_timeout_ms_);
+      while (std::chrono::steady_clock::now() < deadline) {
+        can_frame frame{};
+        if (!read_frame(frame, deadline)) break;
+        if ((frame.can_id & CAN_EFF_FLAG) || frame.can_dlc < 1) continue;
+        probed_id = candidate;
+        response_can_id = frame.can_id & CAN_SFF_MASK;
+        reported_motor_id = frame.data[0];
+        return true;
+      }
+    }
+    return false;
+  }
+
   struct Feedback { float position_rad, velocity_rad_s, torque_nm, temperature_c; };
   bool receive_feedback(Feedback &out) {
     const auto deadline = std::chrono::steady_clock::now() +
@@ -461,6 +485,7 @@ class Rs03TorqueClosedLoopNode final : public rclcpp::Node {
     const auto motor_id = declare_parameter("motor_id", 1);
     const auto master_id = declare_parameter("master_id", 255);
     const auto mit_host_id = declare_parameter("mit_host_id", 0xfd);
+    const auto mit_scan_ids = declare_parameter("mit_scan_ids", false);
     motor_protocol_ = declare_parameter("motor_protocol", "private");
     protocol_switch_target_ =
         declare_parameter("protocol_switch_target", "none");
@@ -545,11 +570,38 @@ class Rs03TorqueClosedLoopNode final : public rclcpp::Node {
     if (protocol_switch_target_ != "none" && auto_enable_)
       throw std::invalid_argument(
           "protocol switching requires auto_enable=false");
+    if (mit_scan_ids && (motor_protocol_ != "mit" || auto_enable_ ||
+                         protocol_switch_target_ != "none"))
+      throw std::invalid_argument(
+          "mit_scan_ids requires motor_protocol=mit, auto_enable=false, and "
+          "protocol_switch_target=none");
     can_ = std::make_unique<Rs03Can>(
         transport, iface, serial_device, serial_baud, serial_debug,
         static_cast<uint8_t>(motor_protocol_ == "mit" ? mit_host_id : master_id),
         static_cast<uint8_t>(motor_id),
         receive_timeout, motor_protocol_);
+
+    if (mit_scan_ids) {
+      uint16_t probed_id = 0;
+      uint16_t response_can_id = 0;
+      uint8_t reported_motor_id = 0;
+      if (can_->scan_mit_motor_ids(probed_id, response_can_id,
+                                   reported_motor_id)) {
+        RCLCPP_INFO(get_logger(),
+                    "MIT ID scan found response: probed_id=%u, "
+                    "response_can_id=0x%03X, reported_motor_id=%u",
+                    static_cast<unsigned>(probed_id),
+                    static_cast<unsigned>(response_can_id),
+                    static_cast<unsigned>(reported_motor_id));
+      } else {
+        RCLCPP_FATAL(get_logger(),
+                     "MIT ID scan found no standard-frame response for motor "
+                     "IDs 0..255; verify motor power, CAN wiring, 1 Mbps CAN "
+                     "bitrate, and completed protocol-switch power cycle");
+      }
+      switch_only_ = true;
+      return;
+    }
 
     const std::string command_topic = mode_ == "velocity_pi"
         ? "~/velocity_command_rad_s" : "~/position_offset_command_rad";

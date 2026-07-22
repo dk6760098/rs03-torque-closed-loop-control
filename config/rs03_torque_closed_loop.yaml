@@ -8,6 +8,7 @@ rs03_torque_closed_loop:
     motor_id: 12
     master_id: 255
     mit_host_id: 253               # MIT standard-frame feedback CAN ID (0xFD)
+    mit_scan_ids: false            # safe stop-frame-only scan of MIT motor IDs
     motor_protocol: private         # private | mit (must match motor flash setting)
     protocol_switch_target: none    # none | private | mit; switching needs power cycle
 
