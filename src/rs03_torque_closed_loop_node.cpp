@@ -30,11 +30,12 @@ constexpr uint8_t kTypeEnable = 0x03;
 constexpr uint8_t kTypeStop = 0x04;
 constexpr uint8_t kTypeReadParam = 0x11;
 constexpr uint8_t kTypeWriteParam = 0x12;
+constexpr uint8_t kTypeProtocolSwitch = 0x19;
 constexpr uint16_t kRunMode = 0x7005;
 constexpr float kProtocolTorqueMaxNm = 60.0F;
 constexpr float kPositionMaxRad = 4.0F * static_cast<float>(M_PI);
 // RS03 protocol Type-1 command / Type-2 feedback velocity mapping is
-// -20.0 .. +20.0 rad/s. Using the ±50 range from other motor variants makes
+// -20.0 .. +20.0 rad/s. Using a +/-50 range from other motor variants makes
 // decoded feedback 2.5x too large and can cause false overspeed trips.
 constexpr float kVelocityMaxRadS = 20.0F;
 constexpr float kKpMax = 5000.0F;
@@ -50,6 +51,16 @@ float decode_u16(uint16_t value, float low, float high) {
   return static_cast<float>(value) * (high - low) / 65535.0F + low;
 }
 
+uint16_t encode_u12(float value, float low, float high) {
+  value = std::clamp(value, low, high);
+  return static_cast<uint16_t>(
+      std::lround((value - low) * 4095.0F / (high - low)));
+}
+
+float decode_u12(uint16_t value, float low, float high) {
+  return static_cast<float>(value & 0x0fffU) * (high - low) / 4095.0F + low;
+}
+
 float cyclic_position_error(float absolute_target, float cyclic_feedback) {
   // Type-2 position feedback cycles over -4pi..+4pi, whereas mechPos/loc_ref
   // are absolute multi-turn positions. Compare them modulo the 8pi period.
@@ -63,8 +74,9 @@ class Rs03Can {
   Rs03Can(const std::string &transport, const std::string &iface,
           const std::string &serial_device, int serial_baud,
           bool serial_debug, uint8_t master_id, uint8_t motor_id,
-          int receive_timeout_ms)
+          int receive_timeout_ms, const std::string &motor_protocol)
       : serial_mode_(transport == "serial"),
+        mit_protocol_(motor_protocol == "mit"),
         serial_debug_(serial_debug), receive_timeout_ms_(receive_timeout_ms),
         master_id_(master_id), motor_id_(motor_id) {
     if (serial_mode_) {
@@ -125,6 +137,8 @@ class Rs03Can {
   ~Rs03Can() { if (fd_ >= 0) close(fd_); }
 
   void set_mode(uint8_t mode) {
+    if (mit_protocol_)
+      throw std::logic_error("private run_mode write requested in MIT protocol");
     std::array<uint8_t, 8> data{};
     data[0] = static_cast<uint8_t>(kRunMode & 0xff);
     data[1] = static_cast<uint8_t>(kRunMode >> 8);
@@ -133,6 +147,7 @@ class Rs03Can {
   }
 
   bool read_u8_parameter(uint16_t index, uint8_t &value) {
+    if (mit_protocol_) return false;
     std::array<uint8_t, 8> request{};
     request[0] = static_cast<uint8_t>(index & 0xff);
     request[1] = static_cast<uint8_t>(index >> 8);
@@ -158,11 +173,13 @@ class Rs03Can {
   }
 
   void set_torque(float torque_nm) {
-    set_mit(0.0F, 0.0F, 0.0F, 0.0F, torque_nm);
+    if (mit_protocol_)
+      throw std::logic_error("private torque frame requested in MIT protocol");
+    set_private_motion(0.0F, 0.0F, 0.0F, 0.0F, torque_nm);
   }
 
-  void set_mit(float position_rad, float velocity_rad_s, float kp, float kd,
-               float feedforward_torque_nm) {
+  void set_private_motion(float position_rad, float velocity_rad_s, float kp,
+                          float kd, float feedforward_torque_nm) {
     can_frame frame{};
     const uint16_t torque_raw = encode_u16(
         feedforward_torque_nm, -kProtocolTorqueMaxNm, kProtocolTorqueMaxNm);
@@ -182,8 +199,80 @@ class Rs03Can {
     write_frame(frame);
   }
 
-  void enable() { send(kTypeEnable, master_id_, {}); }
-  void stop() { send(kTypeStop, master_id_, {}); }
+  void set_mit(float position_rad, float velocity_rad_s, float kp, float kd,
+               float feedforward_torque_nm) {
+    if (!mit_protocol_)
+      throw std::logic_error("standard MIT frame requested in private protocol");
+    can_frame frame{};
+    frame.can_id = static_cast<canid_t>(motor_id_);  // mode bits 10..8 = 0
+    frame.can_dlc = 8;
+    const uint16_t p = encode_u16(
+        position_rad, -kPositionMaxRad, kPositionMaxRad);
+    const uint16_t v = encode_u12(
+        velocity_rad_s, -kVelocityMaxRadS, kVelocityMaxRadS);
+    const uint16_t kp_raw = encode_u12(kp, 0.0F, kKpMax);
+    const uint16_t kd_raw = encode_u12(kd, 0.0F, kKdMax);
+    const uint16_t t = encode_u12(
+        feedforward_torque_nm, -kProtocolTorqueMaxNm, kProtocolTorqueMaxNm);
+    frame.data[0] = p >> 8;
+    frame.data[1] = p & 0xff;
+    frame.data[2] = v >> 4;
+    frame.data[3] = static_cast<uint8_t>(((v & 0x0f) << 4) | (kp_raw >> 8));
+    frame.data[4] = kp_raw & 0xff;
+    frame.data[5] = kd_raw >> 4;
+    frame.data[6] = static_cast<uint8_t>(((kd_raw & 0x0f) << 4) | (t >> 8));
+    frame.data[7] = t & 0xff;
+    write_frame(frame);
+  }
+
+  void set_mit_mode() {
+    if (!mit_protocol_)
+      throw std::logic_error("MIT mode command requested in private protocol");
+    std::array<uint8_t, 8> data{};
+    data.fill(0xff);
+    data[6] = 0x00;
+    data[7] = 0xfc;
+    send_standard(motor_id_, data);
+  }
+
+  void switch_protocol(const std::string &target) {
+    const uint8_t value = target == "mit" ? 2 : 0;
+    if (!mit_protocol_) {
+      std::array<uint8_t, 8> data{};
+      data[0] = 1; data[1] = 2; data[2] = 3;
+      data[3] = 4; data[4] = 5; data[5] = 6;
+      data[6] = value;
+      send(kTypeProtocolSwitch, master_id_, data);
+    } else {
+      std::array<uint8_t, 8> data{};
+      data.fill(0xff);
+      data[6] = value;
+      data[7] = 0xfd;
+      send_standard(motor_id_, data);
+    }
+  }
+
+  void enable() {
+    if (!mit_protocol_) {
+      send(kTypeEnable, master_id_, {});
+      return;
+    }
+    std::array<uint8_t, 8> data{};
+    data.fill(0xff);
+    data[7] = 0xfc;
+    send_standard(motor_id_, data);
+  }
+
+  void stop() {
+    if (!mit_protocol_) {
+      send(kTypeStop, master_id_, {});
+      return;
+    }
+    std::array<uint8_t, 8> data{};
+    data.fill(0xff);
+    data[7] = 0xfd;
+    send_standard(motor_id_, data);
+  }
 
   struct Feedback { float position_rad, velocity_rad_s, torque_nm, temperature_c; };
   bool receive_feedback(Feedback &out) {
@@ -192,6 +281,26 @@ class Rs03Can {
     while (std::chrono::steady_clock::now() < deadline) {
       can_frame frame{};
       if (!read_frame(frame, deadline)) return false;
+      if (mit_protocol_) {
+        if ((frame.can_id & CAN_EFF_FLAG) || frame.can_dlc < 8 ||
+            (frame.can_id & CAN_SFF_MASK) != master_id_ ||
+            frame.data[0] != motor_id_)
+          continue;
+        const uint16_t p =
+            (static_cast<uint16_t>(frame.data[1]) << 8) | frame.data[2];
+        const uint16_t v =
+            (static_cast<uint16_t>(frame.data[3]) << 4) | (frame.data[4] >> 4);
+        const uint16_t t =
+            (static_cast<uint16_t>(frame.data[4] & 0x0f) << 8) | frame.data[5];
+        const uint16_t temp =
+            (static_cast<uint16_t>(frame.data[6]) << 8) | frame.data[7];
+        out = {decode_u16(p, -kPositionMaxRad, kPositionMaxRad),
+               decode_u12(v, -kVelocityMaxRadS, kVelocityMaxRadS),
+               decode_u12(t, -kProtocolTorqueMaxNm, kProtocolTorqueMaxNm),
+               temp > 200 ? static_cast<float>(temp) * 0.1F
+                          : static_cast<float>(temp)};
+        return true;
+      }
       if (!(frame.can_id & CAN_EFF_FLAG)) continue;
       const uint32_t id = frame.can_id & CAN_EFF_MASK;
       if (((id >> 24) & 0x1f) != kTypeFeedback || frame.can_dlc < 8 ||
@@ -220,6 +329,14 @@ class Rs03Can {
     write_frame(frame);
   }
 
+  void send_standard(uint16_t id, const std::array<uint8_t, 8> &data) {
+    can_frame frame{};
+    frame.can_id = id & CAN_SFF_MASK;
+    frame.can_dlc = 8;
+    std::copy(data.begin(), data.end(), frame.data);
+    write_frame(frame);
+  }
+
   void write_frame(const can_frame &frame) {
     if (!serial_mode_) {
       if (write(fd_, &frame, sizeof(frame)) != sizeof(frame))
@@ -227,8 +344,11 @@ class Rs03Can {
                                  std::strerror(errno));
       return;
     }
-    const uint32_t can_id = frame.can_id & CAN_EFF_MASK;
-    const uint32_t serial_id = (can_id << 3) | kSerialExtendedFrameFlag;
+    const bool extended = (frame.can_id & CAN_EFF_FLAG) != 0;
+    const uint32_t can_id = extended
+        ? (frame.can_id & CAN_EFF_MASK) : (frame.can_id & CAN_SFF_MASK);
+    const uint32_t serial_id =
+        (can_id << 3) | (extended ? kSerialExtendedFrameFlag : 0U);
     std::array<uint8_t, 17> packet{};
     packet[0] = 'A'; packet[1] = 'T';
     packet[2] = static_cast<uint8_t>(serial_id >> 24);
@@ -306,12 +426,14 @@ class Rs03Can {
       if (dlc > 8) { found_a = false; continue; }
       uint8_t payload[10]{};
       if (!read_exact(payload, dlc + 2, deadline)) return false;
-      if ((serial_id & 0x07) != kSerialExtendedFrameFlag ||
+      const uint8_t frame_flags = serial_id & 0x07;
+      if ((frame_flags != 0 && frame_flags != kSerialExtendedFrameFlag) ||
           payload[dlc] != '\r' || payload[dlc + 1] != '\n') {
         found_a = false; continue;
       }
       frame = {};
-      frame.can_id = CAN_EFF_FLAG | (serial_id >> 3);
+      frame.can_id = (serial_id >> 3) |
+          (frame_flags == kSerialExtendedFrameFlag ? CAN_EFF_FLAG : 0U);
       frame.can_dlc = dlc;
       std::copy(payload, payload + dlc, frame.data);
       return true;
@@ -321,6 +443,7 @@ class Rs03Can {
 
   int fd_{-1};
   bool serial_mode_{false};
+  bool mit_protocol_{false};
   bool serial_debug_{false};
   int receive_timeout_ms_{20};
   uint8_t master_id_;
@@ -337,6 +460,9 @@ class Rs03TorqueClosedLoopNode final : public rclcpp::Node {
     const auto serial_debug = declare_parameter("serial_debug", false);
     const auto motor_id = declare_parameter("motor_id", 1);
     const auto master_id = declare_parameter("master_id", 255);
+    motor_protocol_ = declare_parameter("motor_protocol", "private");
+    protocol_switch_target_ =
+        declare_parameter("protocol_switch_target", "none");
     mode_ = declare_parameter("control_mode", "velocity_pi");
     auto_enable_ = declare_parameter("auto_enable", false);
     timeout_s_ = declare_parameter("command_timeout_s", 0.30);
@@ -401,10 +527,25 @@ class Rs03TorqueClosedLoopNode final : public rclcpp::Node {
           "control_mode must be velocity_pi, position_pid, or mit_impedance");
     if (transport != "serial" && transport != "socketcan")
       throw std::invalid_argument("transport must be serial or socketcan");
+    if (motor_protocol_ != "private" && motor_protocol_ != "mit")
+      throw std::invalid_argument("motor_protocol must be private or mit");
+    if (protocol_switch_target_ != "none" &&
+        protocol_switch_target_ != "private" &&
+        protocol_switch_target_ != "mit")
+      throw std::invalid_argument(
+          "protocol_switch_target must be none, private, or mit");
+    if (protocol_switch_target_ == "none" &&
+        ((mode_ == "mit_impedance") != (motor_protocol_ == "mit")))
+      throw std::invalid_argument(
+          "mit_impedance requires motor_protocol=mit; velocity_pi and "
+          "position_pid require motor_protocol=private");
+    if (protocol_switch_target_ != "none" && auto_enable_)
+      throw std::invalid_argument(
+          "protocol switching requires auto_enable=false");
     can_ = std::make_unique<Rs03Can>(
         transport, iface, serial_device, serial_baud, serial_debug,
         static_cast<uint8_t>(master_id), static_cast<uint8_t>(motor_id),
-        receive_timeout);
+        receive_timeout, motor_protocol_);
 
     const std::string command_topic = mode_ == "velocity_pi"
         ? "~/velocity_command_rad_s" : "~/position_offset_command_rad";
@@ -428,7 +569,7 @@ class Rs03TorqueClosedLoopNode final : public rclcpp::Node {
             applied_command_ = 0.0F;
             integral_torque_nm_ = 0.0F;
             mit_applied_offset_rad_ = 0.0F;
-            can_->set_torque(0.0F);
+            send_neutral_command();
             can_->enable();
             enabled_ = true;
             armed_waiting_for_command_ = false;
@@ -466,20 +607,42 @@ class Rs03TorqueClosedLoopNode final : public rclcpp::Node {
     else
       RCLCPP_WARN(get_logger(), "no RS03 feedback after safe stop probe");
 
+    if (protocol_switch_target_ != "none") {
+      if (protocol_switch_target_ == motor_protocol_) {
+        throw std::invalid_argument(
+            "protocol_switch_target already matches motor_protocol");
+      }
+      can_->switch_protocol(protocol_switch_target_);
+      switch_only_ = true;
+      RCLCPP_FATAL(
+          get_logger(),
+          "protocol switch command sent: %s -> %s. Disconnect motor power, "
+          "wait, power it again, then launch with motor_protocol:=%s. "
+          "Do not send motion commands in this process.",
+          motor_protocol_.c_str(), protocol_switch_target_.c_str(),
+          protocol_switch_target_.c_str());
+      return;
+    }
+
     if (auto_enable_) {
       if (!motor_online)
         throw std::runtime_error("refusing to enable: no valid RS03 feedback");
-      const uint8_t run_mode = 0;
-      can_->set_mode(run_mode);
-      uint8_t confirmed_run_mode = 0xff;
-      if (!can_->read_u8_parameter(kRunMode, confirmed_run_mode) ||
-          confirmed_run_mode != run_mode) {
-        throw std::runtime_error(
-            "refusing to enable: RS03 run_mode write could not be verified");
+      if (motor_protocol_ == "private") {
+        const uint8_t run_mode = 0;
+        can_->set_mode(run_mode);
+        uint8_t confirmed_run_mode = 0xff;
+        if (!can_->read_u8_parameter(kRunMode, confirmed_run_mode) ||
+            confirmed_run_mode != run_mode) {
+          throw std::runtime_error(
+              "refusing to enable: RS03 run_mode write could not be verified");
+        }
+        RCLCPP_INFO(get_logger(), "RS03 private run_mode confirmed: %u",
+                    static_cast<unsigned>(confirmed_run_mode));
+      } else {
+        can_->set_mit_mode();
+        RCLCPP_INFO(get_logger(), "RS03 standard-frame MIT mode selected");
       }
-      RCLCPP_INFO(get_logger(), "RS03 run_mode confirmed: %u",
-                  static_cast<unsigned>(confirmed_run_mode));
-      can_->set_torque(0.0F);
+      send_neutral_command();
       armed_waiting_for_command_ = true;
       RCLCPP_WARN(get_logger(),
                   "%s armed; motor remains disabled until the first valid command",
@@ -497,6 +660,7 @@ class Rs03TorqueClosedLoopNode final : public rclcpp::Node {
 
  private:
   void update() {
+    if (switch_only_) return;
     if (!enabled_) return;
     const auto ros_now = now();
     const auto update_time = std::chrono::steady_clock::now();
@@ -673,11 +837,21 @@ class Rs03TorqueClosedLoopNode final : public rclcpp::Node {
   }
 
   void send_zero_command() {
-    can_->set_torque(0.0F);
+    send_neutral_command();
+  }
+
+  void send_neutral_command() {
+    if (motor_protocol_ == "mit") {
+      can_->set_mit(last_position_feedback_rad_, 0.0F, 0.0F, 0.0F, 0.0F);
+    } else {
+      can_->set_torque(0.0F);
+    }
   }
 
   std::unique_ptr<Rs03Can> can_;
   std::string mode_;
+  std::string motor_protocol_{"private"};
+  std::string protocol_switch_target_{"none"};
   double timeout_s_{0.30}, max_torque_nm_{0.5}, torque_slew_rate_{2.0};
   double max_velocity_command_rad_s_{0.30};
   double position_max_offset_rad_{0.15}, position_tracking_error_rad_{0.25};
@@ -701,6 +875,7 @@ class Rs03TorqueClosedLoopNode final : public rclcpp::Node {
   float control_error_{0.0F};
   bool has_position_feedback_{false};
   bool auto_enable_{false}, armed_waiting_for_command_{false};
+  bool switch_only_{false};
   bool enabled_{false}, command_seen_{false}, timeout_reported_{false};
   rclcpp::Time last_command_{0, 0, RCL_ROS_TIME};
   std::chrono::steady_clock::time_point last_update_{std::chrono::steady_clock::now()};

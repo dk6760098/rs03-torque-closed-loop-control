@@ -1,21 +1,29 @@
 # RS03 Torque Closed-Loop Control
 
-这个ROS2 Humble包让RS03始终工作在`run_mode=0`（Type-1/MIT协议），并提供三种
-基于力矩的闭环实验：
+> 安全修正：初始版本把私有协议`run_mode=0`运控帧误标为真正MIT协议，实机会
+> 发生高速反向运动。请更新到最新版本；新版本禁止在`motor_protocol=private`时
+> 启动`mit_impedance`。
+
+这个ROS2 Humble包提供三种基于力矩的闭环实验。RS03的“私有协议运控模式”与
+“MIT标准协议”是两套不同的线上协议，不能混用：
+
+协议格式依据[RS03官方产品资料](https://github.com/RobStride/Product_Information/tree/main/%E4%BA%A7%E5%93%81%E8%B5%84%E6%96%99/RS03)。
 
 - `velocity_pi`：ROS2节点读取实际速度，用PI计算目标力矩；
 - `position_pid`：ROS2节点读取位置和速度，用PID/PD计算目标力矩；
-- `mit_impedance`：把目标位置、`Kp`、`Kd`和前馈力矩直接放进MIT复合帧，
+- `mit_impedance`：切换到真正的11位标准帧MIT协议后，把目标位置、速度、
+  `Kp`、`Kd`和前馈力矩按16/12位格式打包进MIT复合帧，
   由驱动器高速执行弹簧—阻尼控制。
 
-这不是RS03原生速度模式或PP位置模式。三种模式最终都通过MIT/力矩接口调用
-驱动器内部电流PI。
+`velocity_pi`和`position_pid`使用私有协议的29位扩展帧；`mit_impedance`必须使用
+MIT协议的11位标准帧。电机协议切换写入后需要断电重启才生效。三种模式最终都
+调用驱动器内部电流PI。
 
 ## 控制结构
 
 ```text
-velocity_pi:  速度误差 -> PI + anti-windup -> 力矩限幅/斜坡 -> MIT纯力矩帧
-position_pid: 位置误差 -> PID + anti-windup -> 力矩限幅/斜坡 -> MIT纯力矩帧
+velocity_pi:  速度误差 -> PI + anti-windup -> 私有运控纯力矩帧
+position_pid: 位置误差 -> PID + anti-windup -> 私有运控纯力矩帧
 mit_impedance:目标位置/Kp/Kd/前馈力矩 ---------------------> MIT复合帧
                                                           -> 内部电流PI
 ```
@@ -113,20 +121,51 @@ ros2 topic pub --rate 50 \
 
 ## MIT阻抗模式
 
+### 1. 从私有协议切换到MIT协议（只执行一次）
+
+当前项目原有电流、力矩、速度和PP测试能够读取`run_mode`，说明电机目前是私有
+协议。先确保电机停止，然后执行：
+
+```bash
+ros2 launch rs03_torque_closed_loop_control rs03_torque_closed_loop.launch.py \
+  auto_enable:=false \
+  motor_protocol:=private \
+  protocol_switch_target:=mit \
+  control_mode:=velocity_pi
+```
+
+看到`protocol switch command sent`后，彻底断开电机电源，等待数秒，再重新上电。
+协议切换会改变后续所有CAN帧格式；未断电前不要继续发送控制命令。
+
+### 2. 只探测MIT标准帧反馈
+
+```bash
+ros2 launch rs03_torque_closed_loop_control rs03_torque_closed_loop.launch.py \
+  auto_enable:=false \
+  motor_protocol:=mit \
+  control_mode:=mit_impedance
+```
+
+只有看到有效位置、速度、力矩和温度反馈后才能使能。如果没有反馈，立即停止，
+不要尝试`auto_enable:=true`。
+
+### 3. MIT低参数测试
+
 终端一：
 
 ```bash
 ros2 launch rs03_torque_closed_loop_control rs03_torque_closed_loop.launch.py \
   auto_enable:=true \
+  motor_protocol:=mit \
   control_mode:=mit_impedance \
-  position_max_offset_rad:=0.08 \
-  position_tracking_error_rad:=0.15 \
-  mit_kp:=2.0 \
-  mit_kd:=0.20 \
+  position_max_offset_rad:=0.03 \
+  position_tracking_error_rad:=0.08 \
+  mit_kp:=1.5 \
+  mit_kd:=0.05 \
   mit_feedforward_torque_nm:=0.0 \
-  mit_position_slew_rate_rad_s:=0.03 \
-  max_torque_nm:=0.40 \
-  max_velocity_rad_s:=0.50
+  mit_position_slew_rate_rad_s:=0.01 \
+  max_torque_nm:=0.20 \
+  max_velocity_rad_s:=0.30
 ```
 
 终端二：
@@ -134,7 +173,7 @@ ros2 launch rs03_torque_closed_loop_control rs03_torque_closed_loop.launch.py \
 ```bash
 ros2 topic pub --rate 50 \
   /rs03_torque_closed_loop/position_offset_command_rad \
-  std_msgs/msg/Float32 "{data: 0.02}"
+  std_msgs/msg/Float32 "{data: 0.005}"
 ```
 
 MIT帧中的理论控制关系为：
@@ -148,6 +187,19 @@ torque ≈ Kp * (target_position - position)
 当前目标速度固定为0，因此该模式用于位置保持/阻抗实验。节点会通过调整前馈项，
 把估算的`P+D+FF`力矩限制在`max_torque_nm`附近；但这不是独立轴端力矩传感器
 形成的硬力矩限制，所以超速、温度、位置误差和机械急停仍然必须保留。
+
+### 切回私有协议
+
+```bash
+ros2 launch rs03_torque_closed_loop_control rs03_torque_closed_loop.launch.py \
+  auto_enable:=false \
+  motor_protocol:=mit \
+  protocol_switch_target:=private \
+  control_mode:=mit_impedance
+```
+
+看到切换提示后再次彻底断电、等待并重新上电。之后使用
+`motor_protocol:=private`运行速度PI或位置PID。
 
 ## 反馈与诊断
 
