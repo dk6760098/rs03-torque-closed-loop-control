@@ -1,8 +1,8 @@
 # RS03 Torque Closed-Loop Control
 
-> 安全修正：初始版本把私有协议`run_mode=0`运控帧误标为真正MIT协议，实机会
-> 发生高速反向运动。请更新到最新版本；新版本禁止在`motor_protocol=private`时
-> 启动`mit_impedance`。
+> `mit_impedance`表示弹簧—阻尼控制算法，不等同于线上的MIT通信协议。
+> 本项目既可通过私有协议Type-1运控复合帧实现该效果，也可通过真正的MIT标准帧实现。
+> `motor_protocol`必须与电机当前烧录的通信协议一致。
 
 这个ROS2 Humble包提供三种基于力矩的闭环实验。RS03的“私有协议运控模式”与
 “MIT标准协议”是两套不同的线上协议，不能混用：
@@ -11,21 +11,19 @@
 
 - `velocity_pi`：ROS2节点读取实际速度，用PI计算目标力矩；
 - `position_pid`：ROS2节点读取位置和速度，用PID/PD计算目标力矩；
-- `mit_impedance`：切换到真正的11位标准帧MIT协议后，把目标位置、速度、
-  `Kp`、`Kd`和前馈力矩按16/12位格式打包进MIT复合帧，
-  由驱动器高速执行弹簧—阻尼控制。
+- `mit_impedance`：把目标位置、速度、`Kp`、`Kd`和前馈力矩打包进复合运控帧，
+  由驱动器高速执行弹簧—阻尼控制；私有Type-1和MIT标准帧都支持。
 
-`velocity_pi`和`position_pid`使用私有协议的29位扩展帧；`mit_impedance`必须使用
-MIT协议的11位标准帧。电机协议切换写入后需要断电重启才生效。三种模式最终都
-调用驱动器内部电流PI。
+`velocity_pi`和`position_pid`必须使用私有协议的29位扩展帧；`mit_impedance`可使用
+私有协议Type-1扩展帧或MIT协议11位标准帧。电机协议切换写入后需要断电重启才
+生效。三种模式最终都调用驱动器内部电流PI。
 
 ## 控制结构
 
 ```text
 velocity_pi:  速度误差 -> PI + anti-windup -> 私有运控纯力矩帧
 position_pid: 位置误差 -> PID + anti-windup -> 私有运控纯力矩帧
-mit_impedance:目标位置/Kp/Kd/前馈力矩 ---------------------> MIT复合帧
-                                                          -> 内部电流PI
+mit_impedance:目标位置/速度/Kp/Kd/前馈力矩 -> 私有Type-1或MIT复合帧 -> 内部电流PI
 ```
 
 `mit_impedance`中的`Kp`表现为刚度，`Kd`表现为阻尼：外力推开电机后会出现
@@ -132,6 +130,39 @@ ros2 topic pub --rate 50 \
 
 ## MIT阻抗模式
 
+### 私有协议下演示MIT式控制（推荐用于当前CH340链路）
+
+电机必须处于私有协议。终端一启动节点：
+
+```bash
+ros2 launch rs03_torque_closed_loop_control rs03_torque_closed_loop.launch.py \
+  motor_protocol:=private control_mode:=mit_impedance auto_enable:=true \
+  position_max_offset_rad:=0.10 max_velocity_command_rad_s:=0.20 \
+  mit_kp:=1.0 mit_kd:=0.15 mit_feedforward_torque_nm:=0.0 \
+  max_torque_nm:=0.35 max_velocity_rad_s:=0.50
+```
+
+终端二持续发布位置偏移；这是使能和看门狗的主命令：
+
+```bash
+ros2 topic pub -r 50 /rs03_torque_closed_loop/position_offset_command_rad \
+  std_msgs/msg/Float32 "{data: 0.03}"
+```
+
+可选：终端三发布目标速度，终端四发布前馈力矩：
+
+```bash
+ros2 topic pub -r 50 /rs03_torque_closed_loop/mit_velocity_command_rad_s \
+  std_msgs/msg/Float32 "{data: 0.05}"
+
+ros2 topic pub -r 50 /rs03_torque_closed_loop/mit_feedforward_torque_command_nm \
+  std_msgs/msg/Float32 "{data: 0.02}"
+```
+
+三项会同时进入`Kp*(p*-p)+Kd*(v*-v)+tau_ff`。位置偏移仍受
+`position_max_offset_rad`限制，速度命令受`max_velocity_command_rad_s`限制，
+估算总力矩受`max_torque_nm`限制。第一次测试不要同时加大三项。
+
 ### 1. 从私有协议切换到MIT协议（只执行一次）
 
 当前项目原有电流、力矩、速度和PP测试能够读取`run_mode`，说明电机目前是私有
@@ -197,7 +228,8 @@ torque ≈ Kp * (target_position - position)
        + feedforward_torque
 ```
 
-当前目标速度固定为0，因此该模式用于位置保持/阻抗实验。节点会通过调整前馈项，
+目标速度默认为0，也可通过`mit_velocity_command_rad_s`话题设置；前馈力矩既可由
+启动参数设置，也可通过`mit_feedforward_torque_command_nm`话题更新。节点会通过调整前馈项，
 把估算的`P+D+FF`力矩限制在`max_torque_nm`附近；但这不是独立轴端力矩传感器
 形成的硬力矩限制，所以超速、温度、位置误差和机械急停仍然必须保留。
 

@@ -563,10 +563,10 @@ class Rs03TorqueClosedLoopNode final : public rclcpp::Node {
       throw std::invalid_argument(
           "protocol_switch_target must be none, private, or mit");
     if (protocol_switch_target_ == "none" &&
-        ((mode_ == "mit_impedance") != (motor_protocol_ == "mit")))
+        motor_protocol_ == "mit" && mode_ != "mit_impedance")
       throw std::invalid_argument(
-          "mit_impedance requires motor_protocol=mit; velocity_pi and "
-          "position_pid require motor_protocol=private");
+          "standard MIT protocol only supports control_mode=mit_impedance; "
+          "private protocol supports all three controller modes");
     if (protocol_switch_target_ != "none" && auto_enable_)
       throw std::invalid_argument(
           "protocol switching requires auto_enable=false");
@@ -635,6 +635,31 @@ class Rs03TorqueClosedLoopNode final : public rclcpp::Node {
                         mode_.c_str(), startup_position_rad_);
           }
         });
+    if (mode_ == "mit_impedance") {
+      mit_velocity_sub_ = create_subscription<std_msgs::msg::Float32>(
+          "~/mit_velocity_command_rad_s", 10,
+          [this](std_msgs::msg::Float32::ConstSharedPtr msg) {
+            if (!std::isfinite(msg->data)) {
+              RCLCPP_ERROR(get_logger(), "rejected non-finite MIT velocity command");
+              return;
+            }
+            mit_velocity_command_rad_s_ = std::clamp(
+                msg->data,
+                -static_cast<float>(max_velocity_command_rad_s_),
+                static_cast<float>(max_velocity_command_rad_s_));
+          });
+      mit_feedforward_sub_ = create_subscription<std_msgs::msg::Float32>(
+          "~/mit_feedforward_torque_command_nm", 10,
+          [this](std_msgs::msg::Float32::ConstSharedPtr msg) {
+            if (!std::isfinite(msg->data)) {
+              RCLCPP_ERROR(get_logger(), "rejected non-finite MIT torque command");
+              return;
+            }
+            mit_feedforward_command_nm_ = std::clamp(
+                msg->data, -static_cast<float>(max_torque_nm_),
+                static_cast<float>(max_torque_nm_));
+          });
+    }
     torque_pub_ = create_publisher<std_msgs::msg::Float32>("~/estimated_torque_nm", 10);
     position_pub_ = create_publisher<std_msgs::msg::Float32>("~/position_rad", 10);
     velocity_pub_ = create_publisher<std_msgs::msg::Float32>("~/velocity_rad_s", 10);
@@ -668,6 +693,8 @@ class Rs03TorqueClosedLoopNode final : public rclcpp::Node {
       last_velocity_feedback_rad_s_ = probe.velocity_rad_s;
       filtered_velocity_rad_s_ = probe.velocity_rad_s;
       has_position_feedback_ = true;
+      mit_feedforward_command_nm_ =
+          static_cast<float>(mit_feedforward_torque_nm_);
       RCLCPP_INFO(get_logger(),
                   "RS03 feedback received: position=%.3f rad, velocity=%.3f rad/s, "
                   "estimated_torque=%.3f Nm, temperature=%.1f C",
@@ -783,11 +810,13 @@ class Rs03TorqueClosedLoopNode final : public rclcpp::Node {
       const float absolute_target = startup_position_rad_ + mit_applied_offset_rad_;
       control_error_ = cyclic_position_error(
           absolute_target, last_position_feedback_rad_);
+      const float velocity_error =
+          mit_velocity_command_rad_s_ - filtered_velocity_rad_s_;
       const float estimated_pd_torque =
-          static_cast<float>(mit_kp_) * control_error_ -
-          static_cast<float>(mit_kd_) * filtered_velocity_rad_s_;
+          static_cast<float>(mit_kp_) * control_error_ +
+          static_cast<float>(mit_kd_) * velocity_error;
       const float raw_estimated_torque = estimated_pd_torque +
-          static_cast<float>(mit_feedforward_torque_nm_);
+          mit_feedforward_command_nm_;
       desired_torque_nm_ = std::clamp(
           raw_estimated_torque,
           -static_cast<float>(max_torque_nm_),
@@ -797,15 +826,22 @@ class Rs03TorqueClosedLoopNode final : public rclcpp::Node {
       // the estimated P+D+FF demand stays inside the configured bench limit.
       // The independent velocity/temperature/tracking trips remain mandatory.
       mit_sent_feedforward_nm_ = std::clamp(
-          static_cast<float>(mit_feedforward_torque_nm_) +
+          mit_feedforward_command_nm_ +
               (desired_torque_nm_ - raw_estimated_torque),
           -kProtocolTorqueMaxNm, kProtocolTorqueMaxNm);
       const float cyclic_target = std::remainder(
           absolute_target, 2.0F * kPositionMaxRad);
-      can_->set_mit(
-          cyclic_target, 0.0F, static_cast<float>(mit_kp_),
-          static_cast<float>(mit_kd_),
-          mit_sent_feedforward_nm_);
+      if (motor_protocol_ == "mit") {
+        can_->set_mit(
+            cyclic_target, mit_velocity_command_rad_s_,
+            static_cast<float>(mit_kp_), static_cast<float>(mit_kd_),
+            mit_sent_feedforward_nm_);
+      } else {
+        can_->set_private_motion(
+            cyclic_target, mit_velocity_command_rad_s_,
+            static_cast<float>(mit_kp_), static_cast<float>(mit_kd_),
+            mit_sent_feedforward_nm_);
+      }
     }
 
     if (mode_ != "mit_impedance") {
@@ -942,6 +978,8 @@ class Rs03TorqueClosedLoopNode final : public rclcpp::Node {
   float integral_torque_nm_{0.0F}, desired_torque_nm_{0.0F};
   float mit_applied_offset_rad_{0.0F};
   float mit_sent_feedforward_nm_{0.0F};
+  float mit_velocity_command_rad_s_{0.0F};
+  float mit_feedforward_command_nm_{0.0F};
   float control_error_{0.0F};
   bool has_position_feedback_{false};
   bool auto_enable_{false}, armed_waiting_for_command_{false};
@@ -950,6 +988,8 @@ class Rs03TorqueClosedLoopNode final : public rclcpp::Node {
   rclcpp::Time last_command_{0, 0, RCL_ROS_TIME};
   std::chrono::steady_clock::time_point last_update_{std::chrono::steady_clock::now()};
   rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr command_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr mit_velocity_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr mit_feedforward_sub_;
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr torque_pub_;
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr position_pub_;
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr velocity_pub_;
